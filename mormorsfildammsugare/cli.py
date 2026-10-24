@@ -4,6 +4,7 @@ import argparse
 from pathlib import Path
 import sys
 
+from .modules.document_devourer import DocumentDevourer, DocumentDevourerOptions, DocumentDevourerStats
 from .modules.photo_sorter import PhotoSorter, PhotoSorterOptions, PhotoSorterStats
 from .modules.sampler import FileSampler, SurveyStats, format_bytes
 
@@ -257,6 +258,93 @@ def handle_restore_photos(args):
         print(f"Restored {restored:,} original files.")
 
 
+def handle_docs(args):
+    dest = Path(args.dest).resolve()
+    sources = [Path(s).resolve() for s in args.sources]
+
+    for s in sources:
+        if not s.exists():
+            print(f"Error: Source path does not exist: {s}", file=sys.stderr)
+            sys.exit(1)
+
+    options = DocumentDevourerOptions(
+        source_dirs=sources,
+        dest_dir=dest,
+        extract_all_formats=args.all_formats,
+        trust_file_times=args.trust_file_dates,
+        is_move=args.move,
+        dry_run=args.dry_run,
+    )
+
+    devourer = DocumentDevourer(options)
+
+    if HAVE_RICH:
+        console = Console()
+        console.print(
+            Panel.fit(
+                f"[bold magenta]👵 MormorsFilDammsugare[/bold magenta] — [cyan]Document Devourer[/cyan]\n"
+                f"[dim]Sources:[/dim] [yellow]{', '.join(str(s) for s in sources)}[/yellow]\n"
+                f"[dim]Destination:[/dim] [green]{dest}[/green]\n"
+                f"[dim]Mode:[/dim] [bold red]{'MOVE' if args.move else 'COPY'}[/bold red]"
+                f"{'  (DRY RUN)' if args.dry_run else ''}",
+                border_style="magenta",
+            )
+        )
+
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            console=console,
+        ) as progress:
+            task = progress.add_task("[cyan]Devouring documents...[/cyan]", total=None)
+            def update(current_file, count):
+                progress.update(task, description=f"[cyan]Devoured {count:,} items ({current_file[:25]}...)[/cyan]")
+            stats = devourer.devour(progress_callback=update)
+
+        console.print()
+        table = Table(title="📄 Document Extraction Complete", border_style="green")
+        table.add_column("Metric", style="bold")
+        table.add_column("Value", justify="right", style="cyan")
+
+        table.add_row("Total Files Scanned", f"{stats.total_scanned:,}")
+        table.add_row("Documents Organized", f"{stats.documents_processed:,}")
+        table.add_row("Duplicates Skipped", f"{stats.duplicates_skipped:,}")
+        table.add_row("Data Transferred", format_bytes(stats.bytes_transferred))
+        if args.move:
+            table.add_row("Originals Removed", f"{stats.originals_removed:,}")
+        console.print(table)
+
+        if stats.category_counts:
+            console.print()
+            cat_table = Table(title="📂 Categories", border_style="blue")
+            cat_table.add_column("Category", style="bold")
+            cat_table.add_column("Documents", justify="right")
+            for cat, cnt in sorted(stats.category_counts.items(), key=lambda x: x[1], reverse=True):
+                cat_table.add_row(cat, f"{cnt:,}")
+            console.print(cat_table)
+    else:
+        print(f"Extracting documents to {dest}...")
+        stats = devourer.devour()
+        print(f"Done! Documents: {stats.documents_processed:,}, Duplicates: {stats.duplicates_skipped:,}")
+
+
+def handle_restore_docs(args):
+    dest = Path(args.dest).resolve()
+    if not dest.exists():
+        print(f"Error: Destination folder does not exist: {dest}", file=sys.stderr)
+        sys.exit(1)
+
+    if HAVE_RICH:
+        console = Console()
+        with console.status("[bold cyan]Restoring original documents from catalog...[/bold cyan]"):
+            restored = PhotoSorter.restore_originals(dest)
+        console.print(f"[bold green]✓ Restored {restored:,} original documents back to their source paths.[/bold green]")
+    else:
+        print("Restoring original documents...")
+        restored = PhotoSorter.restore_originals(dest)
+        print(f"Restored {restored:,} original documents.")
+
+
 def main():
     parser = argparse.ArgumentParser(
         prog="mormor",
@@ -284,6 +372,21 @@ def main():
     p_restore = subparsers.add_parser("restore-photos", help="Restore removed originals back to their sources")
     p_restore.add_argument("--dest", required=True, help="Destination directory containing catalog.db")
     p_restore.set_defaults(func=handle_restore_photos)
+
+    # Command: docs
+    p_docs = subparsers.add_parser("docs", help="Extract, deduplicate and categorize documents (PDF, Office, etc.)")
+    p_docs.add_argument("sources", nargs="+", help="One or more source folders")
+    p_docs.add_argument("--dest", required=True, help="Destination directory for organized documents")
+    p_docs.add_argument("--all-formats", action="store_true", help="Extract all non-media formats, not just standard docs")
+    p_docs.add_argument("--trust-file-dates", action="store_true", help="Trust filesystem timestamps as a fallback year")
+    p_docs.add_argument("--move", action="store_true", help="Move mode: safely remove originals after copy verification")
+    p_docs.add_argument("--dry-run", action="store_true", help="Simulate run without copying any files")
+    p_docs.set_defaults(func=handle_docs)
+
+    # Command: restore-docs
+    p_restore_docs = subparsers.add_parser("restore-docs", help="Restore removed original documents back to their sources")
+    p_restore_docs.add_argument("--dest", required=True, help="Destination directory containing catalog.db")
+    p_restore_docs.set_defaults(func=handle_restore_docs)
 
     args = parser.parse_args()
     if not args.command:
