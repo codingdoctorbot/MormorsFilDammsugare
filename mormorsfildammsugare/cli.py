@@ -452,6 +452,13 @@ def main():
     )
     subparsers = parser.add_subparsers(dest="command", help="Available commands")
 
+    # Command: gui
+    p_gui = subparsers.add_parser("gui", help="Launch the Desktop GUI window")
+    def handle_gui(args):
+        from .gui.app import run_gui
+        run_gui()
+    p_gui.set_defaults(func=handle_gui)
+
     # Command: survey / sample
     p_survey = subparsers.add_parser("survey", aliases=["sample"], help="Survey a folder or drive dump (The Sampler)")
     p_survey.add_argument("path", help="Path to folder or drive to survey")
@@ -511,6 +518,12 @@ def main():
 
     args = parser.parse_args()
     if not args.command:
+        import os
+        # If running in a graphical desktop session (SteamOS Desktop / KDE Plasma), launch GUI
+        if os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"):
+            from .gui.app import run_gui
+            run_gui()
+            return
         parser.print_help()
         sys.exit(0)
 
