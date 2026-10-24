@@ -45,6 +45,7 @@ from ..modules.photo_sorter import PhotoSorter, PhotoSorterOptions
 from ..modules.privacy_scanner import PrivacyScanner, PrivacyScannerOptions
 from ..modules.sampler import FileSampler, format_bytes
 from ..privacy.vault import VaultService
+from .theme import apply_kde_theme
 
 
 # Worker Threads for Background Operations
@@ -108,8 +109,13 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("👵 MormorsFilDammsugare — Backup Triage Suite")
-        self.resize(960, 700)
+        self.resize(1020, 720)
         self.vault = VaultService()
+
+        # Window icon fallback
+        icon_path = Path(__file__).parent / "assets" / "mormors-fildammsugare.png"
+        if icon_path.exists():
+            self.setWindowIcon(QIcon(str(icon_path)))
 
         central = QWidget()
         self.setCentralWidget(central)
@@ -740,8 +746,8 @@ class MainWindow(QMainWindow):
 
 def run_gui():
     app = QApplication(sys.argv)
-    app.setStyle("Fusion")
     window = MainWindow()
+    apply_kde_theme(app, window)
     window.show()
     sys.exit(app.exec())
 
