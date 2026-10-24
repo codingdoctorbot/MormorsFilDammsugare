@@ -118,3 +118,10 @@ To add MormorsFilDammsugare directly to your SteamOS Desktop Application Launche
 # Detect and fix bad/mismatched file extensions:
 ./mormor bad-extensions /path/to/folder --fix
 ```
+
+---
+
+## 🧪 Desktop Testing & Verification
+
+See [TODO.md](TODO.md) for the active SteamOS / KDE Plasma desktop verification checklist covering application menu integration, window rendering on the Steam Deck display, and background worker thread testing.
+
