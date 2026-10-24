@@ -35,6 +35,11 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from ..cleaner.duplicates import delete_duplicates, find_duplicates, pick_keeper
+from ..cleaner.empty_dirs import delete_empty_folders, find_empty_folders
+from ..cleaner.perceptual import find_similar_images
+from ..cleaner.space_hogs import find_space_hogs
+from ..core.walker import walk_files
 from ..modules.document_devourer import DocumentDevourer, DocumentDevourerOptions
 from ..modules.photo_sorter import PhotoSorter, PhotoSorterOptions
 from ..modules.privacy_scanner import PrivacyScanner, PrivacyScannerOptions
@@ -119,6 +124,7 @@ class MainWindow(QMainWindow):
         self._build_docs_tab()
         self._build_privacy_tab()
         self._build_vault_tab()
+        self._build_cleaner_tab()
 
     # --- TAB 0: SURVEY ---
     def _build_survey_tab(self):
@@ -555,6 +561,176 @@ class MainWindow(QMainWindow):
             restored_path = self.vault.restore(target.id)
             QMessageBox.information(self, "Restored", f"Restored to:\n{restored_path}")
             self._refresh_vault_tab()
+
+    # --- TAB 5: CZKAWKA CLEANER ---
+    def _build_cleaner_tab(self):
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+
+        box = QGroupBox("Target Folder")
+        b_layout = QHBoxLayout(box)
+        self.cleaner_src = QLineEdit()
+        self.cleaner_src.setPlaceholderText("Folder to clean...")
+        btn_src = QPushButton("Browse...")
+        btn_src.clicked.connect(lambda: self._browse_dir(self.cleaner_src))
+        b_layout.addWidget(self.cleaner_src)
+        b_layout.addWidget(btn_src)
+        layout.addWidget(box)
+
+        # Tools action row
+        act_box = QGroupBox("Czkawka Tools")
+        act_layout = QHBoxLayout(act_box)
+
+        btn_find_dupes = QPushButton("⚡ Exact Duplicates")
+        btn_find_dupes.clicked.connect(self._run_find_dupes)
+
+        btn_sim_images = QPushButton("🖼️ Similar Photos")
+        btn_sim_images.clicked.connect(self._run_similar_photos)
+
+        btn_empty_dirs = QPushButton("📁 Empty Folders")
+        btn_empty_dirs.clicked.connect(self._run_empty_folders)
+
+        btn_space_hogs = QPushButton("🐳 Big Space Hogs")
+        btn_space_hogs.clicked.connect(self._run_space_hogs)
+
+        act_layout.addWidget(btn_find_dupes)
+        act_layout.addWidget(btn_sim_images)
+        act_layout.addWidget(btn_empty_dirs)
+        act_layout.addWidget(btn_space_hogs)
+        layout.addWidget(act_box)
+
+        self.lbl_cleaner_status = QLabel("Pick a folder and choose a Czkawka cleaner tool.")
+        layout.addWidget(self.lbl_cleaner_status)
+
+        # Cleaner Results Table
+        self.cleaner_table = QTableWidget(0, 3)
+        self.cleaner_table.setHorizontalHeaderLabels(["Name / Group", "Details", "Size / Count"])
+        self.cleaner_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        layout.addWidget(self.cleaner_table)
+
+        self.btn_clean_action = QPushButton("Prune / Trash Selected")
+        self.btn_clean_action.setVisible(False)
+        self.btn_clean_action.clicked.connect(self._perform_cleaner_action)
+        layout.addWidget(self.btn_clean_action)
+
+        self.tabs.addTab(tab, "🧹 5. Czkawka Cleaner")
+
+    def _run_find_dupes(self):
+        src = Path(self.cleaner_src.text().strip())
+        if not src.exists():
+            QMessageBox.warning(self, "Invalid Path", "Select a valid directory.")
+            return
+
+        self.lbl_cleaner_status.setText(f"Scanning for exact duplicates in {src.name}...")
+        self.current_dupe_groups = find_duplicates([src])
+
+        total_dupes = sum(len(g.files) - 1 for g in self.current_dupe_groups)
+        total_wasted = sum(g.size * (len(g.files) - 1) for g in self.current_dupe_groups)
+
+        self.lbl_cleaner_status.setText(f"Found {len(self.current_dupe_groups):,} groups with {total_dupes:,} redundant copies wasting {format_bytes(total_wasted)}.")
+        self.cleaner_table.setRowCount(0)
+        self.cleaner_table.setHorizontalHeaderLabels(["Keep (Winner)", "Remove (Duplicate)", "Wasted Size"])
+
+        for g in self.current_dupe_groups:
+            keeper, to_remove = pick_keeper(g.files, strategy="cleanest")
+            row = self.cleaner_table.rowCount()
+            self.cleaner_table.insertRow(row)
+            self.cleaner_table.setItem(row, 0, QTableWidgetItem(keeper.name))
+            self.cleaner_table.setItem(row, 1, QTableWidgetItem(", ".join(r.name for r in to_remove)))
+            self.cleaner_table.setItem(row, 2, QTableWidgetItem(format_bytes(g.size * len(to_remove))))
+
+        if total_dupes > 0:
+            self.btn_clean_action.setText(f"🗑️ Move {total_dupes:,} Duplicates to Trash ({format_bytes(total_wasted)})")
+            self.btn_clean_action.setVisible(True)
+            self.cleaner_action_mode = "dupes"
+        else:
+            self.btn_clean_action.setVisible(False)
+
+    def _run_similar_photos(self):
+        src = Path(self.cleaner_src.text().strip())
+        if not src.exists():
+            QMessageBox.warning(self, "Invalid Path", "Select a valid directory.")
+            return
+
+        from ..core.sniffer import MediaCategory, sniff_file
+        imgs = [f for f in walk_files(src) if sniff_file(f).category == MediaCategory.PHOTO]
+        self.lbl_cleaner_status.setText(f"Computing perceptual hashes for {len(imgs):,} photos...")
+        groups = find_similar_images(imgs, max_distance=5)
+
+        self.lbl_cleaner_status.setText(f"Found {len(groups):,} clusters of visually similar photos.")
+        self.cleaner_table.setRowCount(0)
+        self.cleaner_table.setHorizontalHeaderLabels(["Base Image", "Similar Photos", "Resolution & Match"])
+
+        for g in groups:
+            base = g.base_image
+            row = self.cleaner_table.rowCount()
+            self.cleaner_table.insertRow(row)
+            self.cleaner_table.setItem(row, 0, QTableWidgetItem(f"{base.path.name} ({base.width}x{base.height})"))
+            sim_names = ", ".join(other.path.name for other, _ in g.similar_images)
+            self.cleaner_table.setItem(row, 1, QTableWidgetItem(sim_names))
+            sim_scores = ", ".join(f"{100 - (d / 128 * 100):.0f}%" for _, d in g.similar_images)
+            self.cleaner_table.setItem(row, 2, QTableWidgetItem(sim_scores))
+
+        self.btn_clean_action.setVisible(False)
+
+    def _run_empty_folders(self):
+        src = Path(self.cleaner_src.text().strip())
+        if not src.exists():
+            QMessageBox.warning(self, "Invalid Path", "Select a valid directory.")
+            return
+
+        self.current_empty_dirs = find_empty_folders(src)
+        self.lbl_cleaner_status.setText(f"Found {len(self.current_empty_dirs):,} empty folders.")
+        self.cleaner_table.setRowCount(0)
+        self.cleaner_table.setHorizontalHeaderLabels(["Empty Directory Path", "Relative Path", "Status"])
+
+        for d in self.current_empty_dirs:
+            row = self.cleaner_table.rowCount()
+            self.cleaner_table.insertRow(row)
+            self.cleaner_table.setItem(row, 0, QTableWidgetItem(str(d)))
+            try:
+                rel = str(d.relative_to(src))
+            except Exception:
+                rel = str(d)
+            self.cleaner_table.setItem(row, 1, QTableWidgetItem(rel))
+            self.cleaner_table.setItem(row, 2, QTableWidgetItem("Empty"))
+
+        if self.current_empty_dirs:
+            self.btn_clean_action.setText(f"🗑️ Delete {len(self.current_empty_dirs):,} Empty Folders")
+            self.btn_clean_action.setVisible(True)
+            self.cleaner_action_mode = "empty_dirs"
+        else:
+            self.btn_clean_action.setVisible(False)
+
+    def _run_space_hogs(self):
+        src = Path(self.cleaner_src.text().strip())
+        if not src.exists():
+            QMessageBox.warning(self, "Invalid Path", "Select a valid directory.")
+            return
+
+        hogs = find_space_hogs([src], top_n=30)
+        self.lbl_cleaner_status.setText(f"Top {len(hogs)} largest files in {src.name}.")
+        self.cleaner_table.setRowCount(0)
+        self.cleaner_table.setHorizontalHeaderLabels(["Filename", "Category / Format", "File Size"])
+
+        for h in hogs:
+            row = self.cleaner_table.rowCount()
+            self.cleaner_table.insertRow(row)
+            self.cleaner_table.setItem(row, 0, QTableWidgetItem(h.path.name))
+            self.cleaner_table.setItem(row, 1, QTableWidgetItem(f"{h.category} ({h.format_name})"))
+            self.cleaner_table.setItem(row, 2, QTableWidgetItem(format_bytes(h.size)))
+
+        self.btn_clean_action.setVisible(False)
+
+    def _perform_cleaner_action(self):
+        if self.cleaner_action_mode == "dupes":
+            removed, freed = delete_duplicates(self.current_dupe_groups, strategy="cleanest", use_trash=True, dry_run=False)
+            QMessageBox.information(self, "Duplicates Cleaned", f"Moved {removed:,} duplicate files to Trash, reclaiming {format_bytes(freed)} space.")
+            self._run_find_dupes()
+        elif self.cleaner_action_mode == "empty_dirs":
+            removed = delete_empty_folders(self.current_empty_dirs, dry_run=False)
+            QMessageBox.information(self, "Pruning Complete", f"Deleted {removed:,} empty folders.")
+            self._run_empty_folders()
 
     def _browse_dir(self, line_edit: QLineEdit):
         folder = QFileDialog.getExistingDirectory(self, "Select Directory")

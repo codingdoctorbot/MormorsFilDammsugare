@@ -4,6 +4,12 @@ import argparse
 from pathlib import Path
 import sys
 
+from .cleaner.bad_extensions import find_bad_extensions, fix_bad_extension
+from .cleaner.duplicates import delete_duplicates, find_duplicates, pick_keeper
+from .cleaner.empty_dirs import delete_empty_folders, find_empty_folders
+from .cleaner.perceptual import find_similar_images
+from .cleaner.space_hogs import find_space_hogs
+from .core.walker import walk_files
 from .modules.document_devourer import DocumentDevourer, DocumentDevourerOptions, DocumentDevourerStats
 from .modules.photo_sorter import PhotoSorter, PhotoSorterOptions, PhotoSorterStats
 from .modules.privacy_scanner import PrivacyScanner, PrivacyScannerOptions, PrivacyScanStats
@@ -445,6 +451,167 @@ def handle_vault(args):
         print(f"Vault action: {args.vault_action}")
 
 
+def handle_clean_dupes(args):
+    dirs = [Path(d).resolve() for d in args.directories]
+    for d in dirs:
+        if not d.exists():
+            print(f"Error: Directory not found: {d}", file=sys.stderr)
+            sys.exit(1)
+
+    if HAVE_RICH:
+        console = Console()
+        console.print(Panel.fit(f"[bold magenta]👵 MormorsFilDammsugare[/bold magenta] — [cyan]Czkawka Duplicate Pruner[/cyan]\n[dim]Scanning:[/dim] {', '.join(str(d) for d in dirs)}", border_style="magenta"))
+
+        with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}"), console=console) as progress:
+            task = progress.add_task("[cyan]Hunting duplicates (3-stage scan)...[/cyan]", total=None)
+            def update(msg, count):
+                progress.update(task, description=f"[cyan]{msg}...[/cyan]")
+            groups = find_duplicates(dirs, progress_callback=update)
+
+        if not groups:
+            console.print("[bold green]✓ Zero duplicate files found.[/bold green]")
+            return
+
+        total_dupes = sum(len(g.files) - 1 for g in groups)
+        total_wasted = sum(g.size * (len(g.files) - 1) for g in groups)
+
+        console.print(f"\n[bold yellow]Found {len(groups):,} duplicate groups ({total_dupes:,} duplicate copies wasting {format_bytes(total_wasted)})[/bold yellow]")
+
+        # Show top 5 groups
+        table = Table(title="Top Duplicate Groups", border_style="yellow")
+        table.add_column("Keep (Winner)", style="green")
+        table.add_column("Remove (Candidate)", style="red")
+        table.add_column("Size", justify="right", style="cyan")
+
+        for g in groups[:5]:
+            keeper, to_remove = pick_keeper(g.files, strategy=args.strategy)
+            table.add_row(f"{keeper.name} [dim]({len(keeper.parts)} dirs)[/dim]", ", ".join(r.name for r in to_remove), format_bytes(g.size))
+        console.print(table)
+
+        if args.delete:
+            with console.status(f"[bold red]Deleting {total_dupes} duplicate files (using Trash: {not args.permanent})...[/bold red]"):
+                removed, freed = delete_duplicates(groups, strategy=args.strategy, use_trash=not args.permanent, dry_run=False)
+            console.print(f"[bold green]✓ Successfully removed {removed:,} duplicates and reclaimed {format_bytes(freed)} space![/bold green]")
+        else:
+            console.print(f"\n[dim]Preview only. To move duplicates to trash, re-run with: [bold]--delete[/bold][/dim]")
+    else:
+        print(f"Finding duplicates in {dirs}...")
+        groups = find_duplicates(dirs)
+        print(f"Found {len(groups)} duplicate groups.")
+
+
+def handle_similar_images(args):
+    dirs = [Path(d).resolve() for d in args.directories]
+    from .core.sniffer import MediaCategory, sniff_file
+
+    image_paths = []
+    for d in dirs:
+        for f in walk_files(d):
+            if sniff_file(f).category == MediaCategory.PHOTO:
+                image_paths.append(f)
+
+    if HAVE_RICH:
+        console = Console()
+        console.print(Panel.fit(f"[bold magenta]👵 MormorsFilDammsugare[/bold magenta] — [cyan]Czkawka Similar Images[/cyan]\n[dim]Photos to compare:[/dim] [yellow]{len(image_paths):,}[/yellow]", border_style="magenta"))
+
+        with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}"), console=console) as progress:
+            task = progress.add_task("[cyan]Computing 128-bit perceptual hashes...[/cyan]", total=None)
+            def update(msg, count):
+                progress.update(task, description=f"[cyan]{msg} ({count:,}/{len(image_paths):,})...[/cyan]")
+            groups = find_similar_images(image_paths, max_distance=args.distance, progress_callback=update)
+
+        if not groups:
+            console.print("[bold green]✓ No visually similar image clusters detected.[/bold green]")
+            return
+
+        console.print(f"\n[bold yellow]Found {len(groups):,} clusters of visually similar photos (threshold ≤ {args.distance}):[/bold yellow]")
+        for i, g in enumerate(groups[:10], start=1):
+            base = g.base_image
+            console.print(f"\n[bold cyan]Cluster #{i}:[/bold cyan] [green]{base.path.name}[/green] ({base.width}x{base.height}, {format_bytes(base.size)})")
+            for other, dist in g.similar_images:
+                sim_pct = max(0, 100 - (dist / 128 * 100))
+                console.print(f"   ≈ [yellow]{other.path.name}[/yellow] ({other.width}x{other.height}, {format_bytes(other.size)}) — [bold]{sim_pct:.1f}% similar[/bold] [dim](diff: {dist})[/dim]")
+    else:
+        print(f"Comparing {len(image_paths)} images...")
+        groups = find_similar_images(image_paths, max_distance=args.distance)
+        print(f"Found {len(groups)} similar image clusters.")
+
+
+def handle_empty_dirs(args):
+    target = Path(args.path).resolve()
+    empty = find_empty_folders(target)
+
+    if HAVE_RICH:
+        console = Console()
+        console.print(Panel.fit(f"[bold magenta]👵 MormorsFilDammsugare[/bold magenta] — [cyan]Empty Folder Pruner[/cyan]\n[dim]Target:[/dim] {target}", border_style="magenta"))
+        if not empty:
+            console.print("[bold green]✓ Zero empty folders found.[/bold green]")
+            return
+        console.print(f"[yellow]Found {len(empty):,} empty directory paths.[/yellow]")
+        for d in empty[:10]:
+            console.print(f"  📁 [dim]{d.relative_to(target)}[/dim]")
+        if len(empty) > 10:
+            console.print(f"  [dim]... and {len(empty) - 10} more.[/dim]")
+
+        if args.delete:
+            removed = delete_empty_folders(empty, dry_run=False)
+            console.print(f"\n[bold green]✓ Deleted {removed:,} empty directories.[/bold green]")
+        else:
+            console.print(f"\n[dim]Preview only. To prune them, re-run with: [bold]--delete[/bold][/dim]")
+    else:
+        print(f"Found {len(empty)} empty folders.")
+
+
+def handle_space_hogs(args):
+    dirs = [Path(d).resolve() for d in args.directories]
+    hogs = find_space_hogs(dirs, top_n=args.top)
+
+    if HAVE_RICH:
+        console = Console()
+        table = Table(title=f"🐳 Top {len(hogs)} Largest Files (Space Hogs)", border_style="yellow")
+        table.add_column("File", style="bold")
+        table.add_column("Category", style="cyan")
+        table.add_column("Format", style="dim")
+        table.add_column("Size", justify="right", style="bold green")
+
+        for h in hogs:
+            table.add_row(h.path.name, h.category, h.format_name, format_bytes(h.size))
+        console.print(table)
+    else:
+        for h in hogs:
+            print(f"{format_bytes(h.size):>10}  {h.path.name}  ({h.format_name})")
+
+
+def handle_bad_extensions(args):
+    dirs = [Path(d).resolve() for d in args.directories]
+    bads = find_bad_extensions(dirs)
+
+    if HAVE_RICH:
+        console = Console()
+        if not bads:
+            console.print("[bold green]✓ All file extensions match their true binary headers.[/bold green]")
+            return
+
+        table = Table(title=f"⚠️ Bad / Mismatched Extensions ({len(bads)} files)", border_style="red")
+        table.add_column("Filename", style="bold")
+        table.add_column("Current Ext", style="red")
+        table.add_column("Detected Format", style="green")
+        table.add_column("Correct Ext", style="bold green")
+
+        for b in bads:
+            table.add_row(b.path.name, b.current_ext, b.detected_format, b.canonical_ext)
+        console.print(table)
+
+        if args.fix:
+            for b in bads:
+                fixed = fix_bad_extension(b)
+                console.print(f"  ✓ Renamed: [dim]{b.path.name}[/dim] -> [bold green]{fixed.name}[/bold green]")
+        else:
+            console.print(f"\n[dim]To automatically rename them to their true extensions, re-run with: [bold]--fix[/bold][/dim]")
+    else:
+        print(f"Found {len(bads)} files with bad extensions.")
+
+
 def main():
     parser = argparse.ArgumentParser(
         prog="mormor",
@@ -515,6 +682,38 @@ def main():
     v_purge = vault_sub.add_parser("purge", help="Permanently delete an item")
     v_purge.add_argument("id", help="Vault Item ID")
     p_vault.set_defaults(func=handle_vault)
+
+    # Command: clean-dupes (Czkawka Exact Duplicates)
+    p_cdupes = subparsers.add_parser("clean-dupes", help="Hunt and prune exact duplicate files (Czkawka engine)")
+    p_cdupes.add_argument("directories", nargs="+", help="Directories to scan for duplicates")
+    p_cdupes.add_argument("--strategy", choices=["cleanest", "oldest", "newest", "shortest_path"], default="cleanest", help="Winner selection strategy")
+    p_cdupes.add_argument("--delete", action="store_true", help="Delete duplicates (moves to Freedesktop Trash by default)")
+    p_cdupes.add_argument("--permanent", action="store_true", help="Permanently delete instead of sending to Trash")
+    p_cdupes.set_defaults(func=handle_clean_dupes)
+
+    # Command: similar-images (Czkawka Similar Images)
+    p_sim = subparsers.add_parser("similar-images", help="Find visually similar, resized, or burst photos (128-bit perceptual hash)")
+    p_sim.add_argument("directories", nargs="+", help="Directories to scan for similar images")
+    p_sim.add_argument("--distance", type=int, default=5, help="Maximum Hamming distance (0=identical, 1-5=similar, default 5)")
+    p_sim.set_defaults(func=handle_similar_images)
+
+    # Command: empty-dirs (Czkawka Empty Folders)
+    p_empty = subparsers.add_parser("empty-dirs", help="Find and delete empty directory trees")
+    p_empty.add_argument("path", help="Directory path to scan")
+    p_empty.add_argument("--delete", action="store_true", help="Delete the empty directories")
+    p_empty.set_defaults(func=handle_empty_dirs)
+
+    # Command: space-hogs (Czkawka Big Files)
+    p_hogs = subparsers.add_parser("space-hogs", help="Find the largest files hogging disk space")
+    p_hogs.add_argument("directories", nargs="+", help="Directories to scan")
+    p_hogs.add_argument("--top", type=int, default=20, help="Number of files to return (default 20)")
+    p_hogs.set_defaults(func=handle_space_hogs)
+
+    # Command: bad-extensions (Czkawka Bad Extensions)
+    p_bad = subparsers.add_parser("bad-extensions", help="Detect files with wrong/mismatched extensions (e.g. .jpg that is .png)")
+    p_bad.add_argument("directories", nargs="+", help="Directories to scan")
+    p_bad.add_argument("--fix", action="store_true", help="Automatically rename files to their correct extension")
+    p_bad.set_defaults(func=handle_bad_extensions)
 
     args = parser.parse_args()
     if not args.command:
