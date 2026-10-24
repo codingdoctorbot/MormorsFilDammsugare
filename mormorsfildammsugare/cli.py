@@ -4,6 +4,7 @@ import argparse
 from pathlib import Path
 import sys
 
+from .modules.photo_sorter import PhotoSorter, PhotoSorterOptions, PhotoSorterStats
 from .modules.sampler import FileSampler, SurveyStats, format_bytes
 
 try:
@@ -172,6 +173,90 @@ def handle_survey(args):
         print(f"Saved survey report to: {out_path}")
 
 
+def handle_photos(args):
+    dest = Path(args.dest).resolve()
+    sources = [Path(s).resolve() for s in args.sources]
+
+    for s in sources:
+        if not s.exists():
+            print(f"Error: Source path does not exist: {s}", file=sys.stderr)
+            sys.exit(1)
+
+    options = PhotoSorterOptions(
+        source_dirs=sources,
+        dest_dir=dest,
+        layout=args.layout,
+        is_move=args.move,
+        dry_run=args.dry_run,
+    )
+
+    sorter = PhotoSorter(options)
+
+    if HAVE_RICH:
+        console = Console()
+        console.print(
+            Panel.fit(
+                f"[bold magenta]👵 MormorsFilDammsugare[/bold magenta] — [cyan]Photo & Video Sorter[/cyan]\n"
+                f"[dim]Sources:[/dim] [yellow]{', '.join(str(s) for s in sources)}[/yellow]\n"
+                f"[dim]Destination:[/dim] [green]{dest}[/green]\n"
+                f"[dim]Layout:[/dim] [blue]{args.layout}[/blue]  |  "
+                f"[dim]Mode:[/dim] [bold red]{'MOVE' if args.move else 'COPY'}[/bold red]"
+                f"{'  (DRY RUN)' if args.dry_run else ''}",
+                border_style="magenta",
+            )
+        )
+
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            console=console,
+        ) as progress:
+            task = progress.add_task("[cyan]Scanning & organizing media...[/cyan]", total=None)
+            def update(current_file, count):
+                progress.update(task, description=f"[cyan]Processed {count:,} items ({current_file[:25]}...)[/cyan]")
+            stats = sorter.organize(progress_callback=update)
+
+        console.print()
+        table = Table(title="🎉 Organization Complete", border_style="green")
+        table.add_column("Metric", style="bold")
+        table.add_column("Value", justify="right", style="cyan")
+
+        table.add_row("Total Files Scanned", f"{stats.total_scanned:,}")
+        table.add_row("Photos Organized", f"{stats.photos_processed:,}")
+        table.add_row("Videos Organized", f"{stats.videos_processed:,}")
+        table.add_row("Duplicates Skipped", f"{stats.duplicates_skipped:,}")
+        table.add_row("Data Transferred", format_bytes(stats.bytes_transferred))
+        if args.move:
+            table.add_row("Originals Removed", f"{stats.originals_removed:,}")
+        console.print(table)
+
+        if stats.errors:
+            console.print(f"[bold yellow]Warnings / Errors ({len(stats.errors)}):[/bold yellow]")
+            for err in stats.errors[:5]:
+                console.print(f"  • [dim]{err}[/dim]")
+    else:
+        print(f"Organizing photos to {dest}...")
+        stats = sorter.organize()
+        print(f"Done! Photos: {stats.photos_processed:,}, Videos: {stats.videos_processed:,}, Duplicates: {stats.duplicates_skipped:,}")
+
+
+def handle_restore_photos(args):
+    dest = Path(args.dest).resolve()
+    if not dest.exists():
+        print(f"Error: Destination folder does not exist: {dest}", file=sys.stderr)
+        sys.exit(1)
+
+    if HAVE_RICH:
+        console = Console()
+        with console.status("[bold cyan]Restoring originals from catalog...[/bold cyan]"):
+            restored = PhotoSorter.restore_originals(dest)
+        console.print(f"[bold green]✓ Restored {restored:,} original files back to their source paths.[/bold green]")
+    else:
+        print("Restoring originals...")
+        restored = PhotoSorter.restore_originals(dest)
+        print(f"Restored {restored:,} original files.")
+
+
 def main():
     parser = argparse.ArgumentParser(
         prog="mormor",
@@ -185,6 +270,20 @@ def main():
     p_survey.add_argument("--no-dupes", action="store_true", help="Skip duplicate calculation for fastest scan")
     p_survey.add_argument("--export-json", help="Export survey results to JSON file")
     p_survey.set_defaults(func=handle_survey)
+
+    # Command: photos
+    p_photos = subparsers.add_parser("photos", help="Extract, deduplicate and organize photos & videos")
+    p_photos.add_argument("sources", nargs="+", help="One or more source folders")
+    p_photos.add_argument("--dest", required=True, help="Destination directory for organized media")
+    p_photos.add_argument("--layout", choices=["continent_year", "country_year", "region_year"], default="continent_year", help="Folder tree layout")
+    p_photos.add_argument("--move", action="store_true", help="Move mode: safely remove originals after copy verification")
+    p_photos.add_argument("--dry-run", action="store_true", help="Simulate run without copying any files")
+    p_photos.set_defaults(func=handle_photos)
+
+    # Command: restore-photos
+    p_restore = subparsers.add_parser("restore-photos", help="Restore removed originals back to their sources")
+    p_restore.add_argument("--dest", required=True, help="Destination directory containing catalog.db")
+    p_restore.set_defaults(func=handle_restore_photos)
 
     args = parser.parse_args()
     if not args.command:
