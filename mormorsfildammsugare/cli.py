@@ -6,7 +6,9 @@ import sys
 
 from .modules.document_devourer import DocumentDevourer, DocumentDevourerOptions, DocumentDevourerStats
 from .modules.photo_sorter import PhotoSorter, PhotoSorterOptions, PhotoSorterStats
+from .modules.privacy_scanner import PrivacyScanner, PrivacyScannerOptions, PrivacyScanStats
 from .modules.sampler import FileSampler, SurveyStats, format_bytes
+from .privacy.vault import VaultService
 
 try:
     from rich.console import Console
@@ -345,6 +347,104 @@ def handle_restore_docs(args):
         print(f"Restored {restored:,} original documents.")
 
 
+def handle_audit(args):
+    sources = [Path(s).resolve() for s in args.sources]
+    for s in sources:
+        if not s.exists():
+            print(f"Error: Source path does not exist: {s}", file=sys.stderr)
+            sys.exit(1)
+
+    options = PrivacyScannerOptions(
+        source_dirs=sources,
+        min_confidence=args.min_conf,
+        strict_only=args.strict,
+        include_suggestive=args.suggestive,
+        quarantine_flagged=args.quarantine,
+        model_name=args.model,
+    )
+
+    scanner = PrivacyScanner(options)
+
+    if HAVE_RICH:
+        console = Console()
+        console.print(
+            Panel.fit(
+                f"[bold magenta]👵 MormorsFilDammsugare[/bold magenta] — [cyan]Privacy & Loaner Audit[/cyan]\n"
+                f"[dim]Sources:[/dim] [yellow]{', '.join(str(s) for s in sources)}[/yellow]\n"
+                f"[dim]Model:[/dim] [blue]{args.model}[/blue]  |  "
+                f"[dim]Min Confidence:[/dim] [blue]{args.min_conf:.2f}[/blue]  |  "
+                f"[dim]Action:[/dim] [bold red]{'QUARANTINE TO VAULT' if args.quarantine else 'AUDIT REPORT ONLY'}[/bold red]",
+                border_style="magenta",
+            )
+        )
+
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            console=console,
+        ) as progress:
+            task = progress.add_task("[cyan]Running AI privacy scan...[/cyan]", total=None)
+            def update(current_file, count):
+                progress.update(task, description=f"[cyan]Audited {count:,} images ({current_file[:25]}...)[/cyan]")
+            stats = scanner.scan(progress_callback=update)
+
+        console.print()
+        if not stats.flagged_files:
+            console.print("[bold green]✓ Clean! Zero explicit or sensitive items detected.[/bold green]")
+        else:
+            table = Table(title=f"⚠️ Flagged Items ({len(stats.flagged_files)} detected)", border_style="red")
+            table.add_column("File", style="bold")
+            table.add_column("Detected Classes", style="yellow")
+            table.add_column("Max Conf", justify="right", style="cyan")
+            table.add_column("Status", justify="center", style="bold red")
+
+            for res in stats.flagged_files:
+                classes_str = ", ".join(f"{d.friendly_name} ({d.confidence:.2f})" for d in res.detections[:3])
+                status = "Quarantined" if args.quarantine else "Flagged"
+                table.add_row(res.filepath.name, classes_str, f"{res.max_confidence:.2f}", status)
+            console.print(table)
+
+            if args.quarantine:
+                console.print(f"\n[bold green]✓ Successfully moved {len(stats.quarantined_records)} items to the Vault.[/bold green]")
+                console.print(f"[dim]Vault location: {scanner.vault.vault_dir}[/dim]")
+    else:
+        print(f"Auditing {sources}...")
+        stats = scanner.scan()
+        print(f"Done! Scanned {stats.total_scanned:,} images. Flagged: {len(stats.flagged_files):,}")
+
+
+def handle_vault(args):
+    vault = VaultService()
+    if HAVE_RICH:
+        console = Console()
+        if args.vault_action == "list":
+            entries = vault.list_entries()
+            if not entries:
+                console.print("[dim]Vault is empty. No quarantined items.[/dim]")
+                return
+            table = Table(title=f"🔒 Quarantined Vault Items ({len(entries)})", border_style="yellow")
+            table.add_column("ID", style="dim")
+            table.add_column("Original Filename", style="bold")
+            table.add_column("Size", justify="right", style="green")
+            table.add_column("Quarantined At", style="cyan")
+            for e in entries:
+                table.add_row(e.id[:8], e.filename, format_bytes(e.size), e.quarantined_at[:19])
+            console.print(table)
+        elif args.vault_action == "restore":
+            target = vault.restore(args.id)
+            if target:
+                console.print(f"[bold green]✓ Restored to: {target}[/bold green]")
+            else:
+                console.print(f"[bold red]Item not found: {args.id}[/bold red]")
+        elif args.vault_action == "purge":
+            if vault.purge(args.id):
+                console.print(f"[bold red]Permanently deleted item: {args.id}[/bold red]")
+            else:
+                console.print(f"[bold red]Item not found: {args.id}[/bold red]")
+    else:
+        print(f"Vault action: {args.vault_action}")
+
+
 def main():
     parser = argparse.ArgumentParser(
         prog="mormor",
@@ -387,6 +487,27 @@ def main():
     p_restore_docs = subparsers.add_parser("restore-docs", help="Restore removed original documents back to their sources")
     p_restore_docs.add_argument("--dest", required=True, help="Destination directory containing catalog.db")
     p_restore_docs.set_defaults(func=handle_restore_docs)
+
+    # Command: audit (privacy / nsfw scan)
+    p_audit = subparsers.add_parser("audit", aliases=["privacy"], help="Audit photos for explicit content before lending a PC")
+    p_audit.add_argument("sources", nargs="+", help="Folders to audit")
+    p_audit.add_argument("--quarantine", action="store_true", help="Move flagged files into the secure Vault")
+    p_audit.add_argument("--strict", action="store_true", help="Only flag high-severity nudity/genitalia")
+    p_audit.add_argument("--suggestive", action="store_true", help="Include covered / suggestive photos")
+    p_audit.add_argument("--model", choices=["320n", "640m"], default="320n", help="Model size: 320n (fast) or 640m (high precision)")
+    p_audit.add_argument("--min-conf", type=float, default=0.50, help="Minimum confidence threshold (0.0 to 1.0, default 0.50)")
+    p_audit.set_defaults(func=handle_audit)
+
+    # Command: vault
+    p_vault = subparsers.add_parser("vault", help="Inspect and manage quarantined files in the Vault")
+    vault_sub = p_vault.add_subparsers(dest="vault_action", required=True)
+
+    v_list = vault_sub.add_parser("list", help="List all quarantined items")
+    v_restore = vault_sub.add_parser("restore", help="Restore an item back to its original path")
+    v_restore.add_argument("id", help="Vault Item ID")
+    v_purge = vault_sub.add_parser("purge", help="Permanently delete an item")
+    v_purge.add_argument("id", help="Vault Item ID")
+    p_vault.set_defaults(func=handle_vault)
 
     args = parser.parse_args()
     if not args.command:
